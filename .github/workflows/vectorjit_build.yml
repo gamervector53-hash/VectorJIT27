@@ -1,4 +1,4 @@
-name: Build VectorJIT IPA
+name: Build VectorJIT27 IPA
 
 permissions:
   contents: write
@@ -6,38 +6,80 @@ permissions:
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
+      - ios27.2-full-v1
 
 jobs:
   build:
+    name: Build full unsigned IPA
     runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v6
+    timeout-minutes: 30
 
-      - name: Show macOS and Xcode
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Show build environment
         run: |
           sw_vers
           xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
 
-      - name: Build unsigned app
+      - name: Validate remote-pairing implementation
         run: |
-          xcodebuild clean archive             -project StikDebug.xcodeproj             -scheme StikDebug             -configuration Debug             -archivePath build/StikDebug.xcarchive             -sdk iphoneos             -destination 'generic/platform=iOS'             ONLY_ACTIVE_ARCH=NO             CODE_SIGN_IDENTITY=""             CODE_SIGNING_REQUIRED=NO             CODE_SIGNING_ALLOWED=NO             SWIFT_OPTIMIZATION_LEVEL="-Onone"             IPHONEOS_DEPLOYMENT_TARGET=17.4
+          grep -q 'rp_pairing_file_generate' StikDebug/Support/PairingFileStore.swift
+          grep -q 'persistRemotePairingFile' StikDebug/Device/JITEnableContext.swift
+          grep -q 'public_key' StikDebug/Support/PairingFileStore.swift
+
+      - name: Archive unsigned release build
+        run: |
+          set -o pipefail
+          xcodebuild clean archive \
+            -project StikDebug.xcodeproj \
+            -scheme StikDebug \
+            -configuration Release \
+            -archivePath build/VectorJIT27.xcarchive \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            IPHONEOS_DEPLOYMENT_TARGET=17.4
 
       - name: Package IPA
         run: |
+          set -euo pipefail
+          APP="build/VectorJIT27.xcarchive/Products/Applications/StikDebug.app"
+          test -d "$APP"
+          test -x "$APP/StikDebug"
+          plutil -lint "$APP/Info.plist"
+          rm -rf Payload
           mkdir -p Payload
-          cp -R build/StikDebug.xcarchive/Products/Applications/StikDebug.app Payload/
-          zip -qry VectorJIT-unsigned.ipa Payload
+          cp -R "$APP" Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload VectorJIT27-unsigned.ipa
+          test -s VectorJIT27-unsigned.ipa
+          shasum -a 256 VectorJIT27-unsigned.ipa | tee VectorJIT27-unsigned.ipa.sha256
 
-      - uses: actions/upload-artifact@v7
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v7
         with:
-          name: VectorJIT-unsigned
-          path: VectorJIT-unsigned.ipa
+          name: VectorJIT27-unsigned
+          path: |
+            VectorJIT27-unsigned.ipa
+            VectorJIT27-unsigned.ipa.sha256
           retention-days: 90
 
       - name: Publish prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="vectorjit-build-${{ github.run_number }}"
-          gh release create "$TAG" VectorJIT-unsigned.ipa             --title "VectorJIT $TAG"             --notes "Unsigned personal-test build. Pairing records are imported and copied intact; no pairing fields are stripped."             --prerelease
+          TAG="vectorjit27-build-${{ github.run_number }}"
+          gh release create "$TAG" \
+            VectorJIT27-unsigned.ipa \
+            VectorJIT27-unsigned.ipa.sha256 \
+            --target "${{ github.sha }}" \
+            --title "VectorJIT27 Full Build ${{ github.run_number }}" \
+            --notes "Full unsigned VectorJIT27 build with separate classic/RPPairing storage, automatic RPPairing generation and persistence, tunnel invalidation, retry handling, and iOS 27.2 diagnostics." \
+            --prerelease

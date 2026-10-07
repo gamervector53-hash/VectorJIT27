@@ -204,9 +204,12 @@ struct SettingsView: View {
                 pairingImportMessage = nil
 
                 do {
-                    try PairingFileStore.importFromPicker(url, fileManager: fileManager)
+                    let kind = try PairingFileStore.importFromPicker(url, fileManager: fileManager)
                     isImportingFile = false
-                    pairingImportMessage = ("Imported successfully", false)
+                    pairingImportMessage = kind == .remote
+                        ? ("Remote pairing identity imported", false)
+                        : ("Classic pairing file saved; remote identity prepared", false)
+                    markTunnelDisconnected()
                     startTunnelInBackground()
                     schedulePairingStatusDismiss()
                 } catch {
