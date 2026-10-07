@@ -1,0 +1,43 @@
+name: Build VectorJIT IPA
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Show macOS and Xcode
+        run: |
+          sw_vers
+          xcodebuild -version
+
+      - name: Build unsigned app
+        run: |
+          xcodebuild clean archive             -project StikDebug.xcodeproj             -scheme StikDebug             -configuration Debug             -archivePath build/StikDebug.xcarchive             -sdk iphoneos             -destination 'generic/platform=iOS'             ONLY_ACTIVE_ARCH=NO             CODE_SIGN_IDENTITY=""             CODE_SIGNING_REQUIRED=NO             CODE_SIGNING_ALLOWED=NO             SWIFT_OPTIMIZATION_LEVEL="-Onone"             IPHONEOS_DEPLOYMENT_TARGET=17.4
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/StikDebug.xcarchive/Products/Applications/StikDebug.app Payload/
+          zip -qry VectorJIT-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: VectorJIT-unsigned
+          path: VectorJIT-unsigned.ipa
+          retention-days: 90
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="vectorjit-build-${{ github.run_number }}"
+          gh release create "$TAG" VectorJIT-unsigned.ipa             --title "VectorJIT $TAG"             --notes "Unsigned personal-test build. Pairing records are imported and copied intact; no pairing fields are stripped."             --prerelease
