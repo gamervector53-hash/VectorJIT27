@@ -354,8 +354,12 @@ struct DeviceInfoView: View {
 
     private func importPairing(from src: URL) {
         do {
-            try PairingFileStore.importFromPicker(src)
-            notify("Pairing File Added", "Your device is ready. Tap Reload to fetch info.")
+            let kind = try PairingFileStore.importFromPicker(src)
+            markTunnelDisconnected()
+            let detail = kind == .remote
+                ? "Remote pairing identity imported. Tap Reload to fetch info."
+                : "Classic pairing file saved and a separate remote identity was prepared."
+            notify("Pairing File Added", detail)
             mgr.initAndLoad()
         } catch {
             fail("Import Failed", error.localizedDescription)

@@ -141,26 +141,36 @@ final class JITEnableContext {
     }
 
     private func getPairingFile() throws -> OpaquePointer {
-        let pairingFileURL = PairingFileStore.prepareURL()
+        var lastReadError: NSError?
 
-        guard FileManager.default.fileExists(atPath: pairingFileURL.path) else {
-            throw makeError("Pairing file not found!", code: -17)
+        for attempt in 0..<2 {
+            let pairingFileURL: URL
+            do {
+                pairingFileURL = attempt == 0
+                    ? try PairingFileStore.ensureRemotePairingRecord()
+                    : try PairingFileStore.regenerateRemotePairingRecord()
+            } catch {
+                throw makeError("Unable to prepare the remote pairing identity: \(error.localizedDescription)", code: -17)
+            }
+
+            var pairingFile: OpaquePointer?
+            let ffiError = pairingFileURL.path.withCString { path in
+                rp_pairing_file_read(path, &pairingFile)
+            }
+
+            if let ffiError {
+                lastReadError = error(from: ffiError, fallback: "Failed to read the remote pairing identity.")
+                continue
+            }
+
+            if let pairingFile {
+                return pairingFile
+            }
+
+            lastReadError = makeError("idevice returned an empty remote pairing handle.", code: -17)
         }
 
-        var pairingFile: OpaquePointer?
-        let ffiError = pairingFileURL.path.withCString { path in
-            rp_pairing_file_read(path, &pairingFile)
-        }
-
-        if let ffiError {
-            throw error(from: ffiError, fallback: "Failed to read pairing file!")
-        }
-
-        guard let pairingFile else {
-            throw makeError("Failed to read pairing file!", code: -17)
-        }
-
-        return pairingFile
+        throw lastReadError ?? makeError("Failed to read the remote pairing identity.", code: -17)
     }
 
     private func createTunnel(hostname: String) throws -> TunnelHandles {
@@ -195,13 +205,28 @@ final class JITEnableContext {
             }
         }
 
+        var persistenceError: NSError?
+        do {
+            try PairingFileStore.persistRemotePairingFile(pairingFile)
+        } catch {
+            persistenceError = makeError(
+                "Failed to persist the updated remote pairing identity: \(error.localizedDescription)",
+                code: -20
+            )
+        }
+
         if let ffiError {
+            tunnel.free()
             throw error(from: ffiError, fallback: "Failed to create tunnel")
         }
 
+        if let persistenceError {
+            tunnel.free()
+            throw persistenceError
+        }
+
         guard tunnel.adapter != nil, tunnel.handshake != nil else {
-            var incompleteTunnel = tunnel
-            incompleteTunnel.free()
+            tunnel.free()
             throw makeError("Tunnel was created without valid handles")
         }
 
@@ -268,6 +293,23 @@ final class JITEnableContext {
     func ensureTunnel() throws {
         if adapter == nil || handshake == nil {
             try startTunnel()
+        }
+    }
+
+    func invalidateTunnel() {
+        tunnelLock.lock()
+        let oldAdapter = adapter
+        let oldHandshake = handshake
+        adapter = nil
+        handshake = nil
+        lastTunnelError = nil
+        tunnelLock.unlock()
+
+        if let oldHandshake {
+            rsd_handshake_free(oldHandshake)
+        }
+        if let oldAdapter {
+            adapter_free(oldAdapter)
         }
     }
 

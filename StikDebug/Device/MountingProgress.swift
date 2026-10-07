@@ -115,12 +115,19 @@ final class MountingProgress: ObservableObject {
 }
 
 func isPairing() -> Bool {
-    let pairingPath = PairingFileStore.prepareURL().path
-    var pairingFile: RpPairingFileHandle?
-    let error = rp_pairing_file_read(pairingPath, &pairingFile)
-    if error != nil {
+    let pairingURL = PairingFileStore.prepareURL()
+    guard PairingFileStore.isRemotePairingRecord(at: pairingURL) else {
         return false
     }
+
+    var pairingFile: RpPairingFileHandle?
+    let error = rp_pairing_file_read(pairingURL.path, &pairingFile)
+    if let error {
+        idevice_error_free(error)
+        return false
+    }
+
+    let isValid = pairingFile != nil
     rp_pairing_file_free(pairingFile)
-    return true
+    return isValid
 }

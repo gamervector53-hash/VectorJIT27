@@ -2,6 +2,10 @@
    <img width="217" height="217" src="/assets/StikDebug.png" alt="Logo">
 </div>
 
+> **VectorJIT27 build:** this repository separates classic MobileDevice pairing records from the RPPairing identity used by the iOS 17.4+ tunnel, automatically generates and persists the remote identity, and adds iOS 27.2 tunnel recovery. See [VECTORJIT.md](VECTORJIT.md) for implementation details.
+
+
+
 <div align="center">
   <h1><b>StikDebug</b></h1>
   <p><i>An on-device debugger/JIT enabler for iOS versions 17.4+ powered by <a href="https://github.com/jkcoxson/idevice">idevice</a>.</i></p>

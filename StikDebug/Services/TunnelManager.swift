@@ -15,6 +15,7 @@ final class TunnelManager: ObservableObject {
     private init() {}
 
     func markDisconnected() {
+        JITEnableContext.shared.invalidateTunnel()
         runOnMain {
             self.isConnected = false
         }
@@ -28,12 +29,6 @@ final class TunnelManager: ObservableObject {
             return
         }
 
-        let pairingFileURL = PairingFileStore.prepareURL()
-        guard FileManager.default.fileExists(atPath: pairingFileURL.path) else {
-            isConnected = false
-            return
-        }
-
         guard !isStarting else {
             return
         }
@@ -41,18 +36,42 @@ final class TunnelManager: ObservableObject {
         isStarting = true
 
         DispatchQueue.global(qos: .userInteractive).async { [showErrorUI] in
-            let result: Result<Void, NSError>
-            do {
-                try JITEnableContext.shared.startTunnel()
-                result = .success(())
-            } catch {
-                result = .failure(error as NSError)
-            }
+            let result = self.connectWithRetry()
 
             DispatchQueue.main.async {
                 self.finishStart(result, showErrorUI: showErrorUI)
             }
         }
+    }
+
+    private func connectWithRetry() -> Result<Void, NSError> {
+        let maximumAttempts = 3
+        var finalError = NSError(
+            domain: "StikDebug",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "Tunnel connection failed."]
+        )
+
+        for attempt in 1...maximumAttempts {
+            do {
+                try JITEnableContext.shared.startTunnel()
+                return .success(())
+            } catch {
+                finalError = error as NSError
+                guard attempt < maximumAttempts, isRetryableTunnelError(finalError) else {
+                    break
+                }
+
+                let delay = TimeInterval(attempt)
+                LogManager.shared.addWarningLog(
+                    "Tunnel attempt \(attempt) failed; retrying in \(Int(delay))s: \(finalError.localizedDescription)"
+                )
+                JITEnableContext.shared.invalidateTunnel()
+                Thread.sleep(forTimeInterval: delay)
+            }
+        }
+
+        return .failure(finalError)
     }
 
     private func finishStart(_ result: Result<Void, NSError>, showErrorUI: Bool) {
@@ -163,6 +182,16 @@ private func tunnelConnectionAlertMessage(for error: NSError) -> String {
             "Open Settings and check the target IP address.",
             "Use the default \(DeviceConnectionContext.defaultTargetIPAddress)."
         ]
+    } else if lowercasedMessage.contains("missing field") &&
+                (lowercasedMessage.contains("public_key") ||
+                 lowercasedMessage.contains("private_key") ||
+                 lowercasedMessage.contains("identifier")) {
+        likelyCause = "A classic MobileDevice pairing file was mistaken for an RPPairing identity."
+        recoverySteps = [
+            "VectorJIT27 keeps the classic file separate and generates a fresh remote pairing identity.",
+            "Tap Try Again once LocalDevVPN is connected.",
+            "If the regenerated identity still fails, disconnect and reconnect LocalDevVPN before retrying."
+        ]
     } else if lowercasedMessage.contains("timed out") || lowercasedMessage.contains("timeout") {
         likelyCause = "The app could not reach the device before the connection timed out."
         recoverySteps = [
@@ -202,4 +231,24 @@ private func tunnelConnectionAlertMessage(for error: NSError) -> String {
     Technical details:
     Code \(error.code): \(rawMessage)
     """
+}
+
+
+private func isRetryableTunnelError(_ error: NSError) -> Bool {
+    let message = error.localizedDescription.lowercased()
+    if error.code == -19 || error.code == 54 {
+        return true
+    }
+
+    let transientMarkers = [
+        "timeout",
+        "timed out",
+        "connect:",
+        "device socket",
+        "connection reset",
+        "connection refused",
+        "network is unreachable",
+        "tls tunnel"
+    ]
+    return transientMarkers.contains { message.contains($0) }
 }
