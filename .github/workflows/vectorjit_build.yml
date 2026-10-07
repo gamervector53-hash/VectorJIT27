@@ -69,7 +69,6 @@ jobs:
           path: |
             VectorJIT27-unsigned.ipa
             VectorJIT27-unsigned.ipa.sha256
-          archive: false
           retention-days: 90
 
       - name: Publish prerelease
