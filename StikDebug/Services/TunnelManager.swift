@@ -212,3 +212,22 @@ func connectionDiagnosticDetails() -> String {
     \(DeviceModelName.name(for: model))
     """
 }
+
+private func isRetryableTunnelError(_ error: NSError) -> Bool {
+    let message = error.localizedDescription.lowercased()
+    if error.code == -19 || error.code == 54 {
+        return true
+    }
+
+    let transientMarkers = [
+        "timeout",
+        "timed out",
+        "connect:",
+        "device socket",
+        "connection reset",
+        "connection refused",
+        "network is unreachable",
+        "tls tunnel"
+    ]
+    return transientMarkers.contains { message.contains($0) }
+}
