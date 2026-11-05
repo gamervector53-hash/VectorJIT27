@@ -8,6 +8,213 @@
 import Foundation
 import idevice
 import Darwin
+import Network
+
+final class RemotePairingPortResolver {
+    static let fallback: UInt16 = 49152
+    private static let overrideKey = "TunnelRemotePairingPort"
+    private static let stateLock = NSLock()
+    private static var selectedEndpoint = "Not attempted yet"
+
+    /// The precise port and discovery method used for the latest connection attempt.
+    static var lastAttemptDescription: String {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return selectedEndpoint
+    }
+
+    private static func record(targetIPAddress: String, port: UInt16, source: String) {
+        let endpoint = "\(targetIPAddress):\(port) (\(source))"
+        stateLock.lock()
+        selectedEndpoint = endpoint
+        stateLock.unlock()
+        NSLog("[StikDebug] Remote Pairing selected endpoint: %@", endpoint)
+    }
+
+    private let discoveryQueue = DispatchQueue(label: "com.stik.remotePairingDiscovery")
+    private let completion = DispatchSemaphore(value: 0)
+    private var browser: NWBrowser?
+    private var connection: NWConnection?
+    private var selectedService: NWEndpoint?
+    private var selectedLoopback = false
+    private var resolvedPort: UInt16?
+    private var finished = false
+
+    static func resolve(targetIPAddress: String = DeviceConnectionContext.targetIPAddress, timeout: TimeInterval = 5) -> UInt16 {
+        let override = (UserDefaults.standard.string(forKey: overrideKey) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !override.isEmpty, let port = UInt16(override), port != 0 {
+            record(targetIPAddress: targetIPAddress, port: port, source: "Manual")
+            return port
+        }
+        if !override.isEmpty {
+            NSLog("[StikDebug] Ignoring invalid manual Remote Pairing port: %@", override)
+        }
+
+        let result = discover(timeout: timeout)
+        record(targetIPAddress: targetIPAddress, port: result.port, source: result.source)
+        return result.port
+    }
+
+    static func discover(timeout: TimeInterval = 5) -> (port: UInt16, source: String) {
+        let worker = RemotePairingPortResolver()
+        worker.discoveryQueue.async {
+            worker.startDiscovery()
+        }
+        _ = worker.completion.wait(timeout: .now() + timeout)
+        return worker.discoveryQueue.sync {
+            worker.finishDiscovery()
+            if let port = worker.resolvedPort {
+                return (port, "Bonjour")
+            }
+            return (fallback, "Fallback")
+        }
+    }
+
+    private static func preferredCandidate(
+        from candidates: [(endpoint: NWEndpoint, isLoopback: Bool)]
+    ) -> (endpoint: NWEndpoint, isLoopback: Bool)? {
+        candidates.first(where: { $0.isLoopback }) ?? candidates.first
+    }
+
+    private func startDiscovery() {
+        guard !finished else { return }
+        let parameters = NWParameters.tcp
+        parameters.includePeerToPeer = true
+        let browser = NWBrowser(
+            for: .bonjour(type: "_remotepairing._tcp", domain: "local."),
+            using: parameters
+        )
+        self.browser = browser
+        browser.browseResultsChangedHandler = { [weak self] results, _ in
+            guard let self, !self.finished else { return }
+            let candidates = results.compactMap { result -> (endpoint: NWEndpoint, isLoopback: Bool)? in
+                guard case .service = result.endpoint else { return nil }
+                let isLoopback = result.interfaces.contains { $0.name.hasPrefix("lo") }
+                return (result.endpoint, isLoopback)
+            }
+            guard let selected = Self.preferredCandidate(from: candidates),
+                  self.selectedService == nil || (!self.selectedLoopback && selected.isLoopback) else {
+                return
+            }
+            self.selectedService = selected.endpoint
+            self.selectedLoopback = selected.isLoopback
+            self.connection?.cancel()
+            let connection = NWConnection(to: selected.endpoint, using: parameters)
+            self.connection = connection
+            connection.pathUpdateHandler = { [weak self, weak connection] path in
+                guard let self, let connection, self.connection === connection, !self.finished else { return }
+                if path.status == .satisfied {
+                    self.recordResolvedPort(from: connection)
+                }
+            }
+            connection.stateUpdateHandler = { [weak self, weak connection] state in
+                guard let self, let connection, self.connection === connection, !self.finished else { return }
+                switch state {
+                case .ready, .waiting:
+                    self.recordResolvedPort(from: connection)
+                case .failed:
+                    self.finishDiscovery()
+                default:
+                    break
+                }
+            }
+            connection.start(queue: self.discoveryQueue)
+        }
+        browser.stateUpdateHandler = { [weak self] state in
+            if case .failed = state {
+                self?.finishDiscovery()
+            }
+        }
+        browser.start(queue: discoveryQueue)
+    }
+
+    private func recordResolvedPort(from connection: NWConnection) {
+        guard case .hostPort(_, let port) = connection.currentPath?.remoteEndpoint,
+              port.rawValue != 0 else { return }
+        resolvedPort = port.rawValue
+        finishDiscovery()
+    }
+
+    private func finishDiscovery() {
+        guard !finished else { return }
+        finished = true
+        browser?.cancel()
+        connection?.cancel()
+        completion.signal()
+    }
+
+}
+
+struct PairingPlacementTarget: Sendable {
+    let pairingFileURL: URL
+    let address: Data
+    let hostname: String
+}
+
+final class PairedDeviceDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
+    private let browser = NetServiceBrowser()
+    private var services: [NetService] = []
+    private let peerHost: String?
+    private var resolvedAddress: Data?
+
+    init(address: Data) {
+        peerHost = Self.numericHost(address)
+        super.init()
+        browser.delegate = self
+        browser.includesPeerToPeer = true
+    }
+
+    static func numericHost(_ address: Data) -> String? {
+        guard address.count >= MemoryLayout<sockaddr>.size else { return nil }
+        return address.withUnsafeBytes { bytes in
+            let socketAddress = bytes.baseAddress!.assumingMemoryBound(to: sockaddr.self)
+            let family = Int32(socketAddress.pointee.sa_family)
+            let length: Int
+            switch family {
+            case AF_INET: length = MemoryLayout<sockaddr_in>.size
+            case AF_INET6: length = MemoryLayout<sockaddr_in6>.size
+            default: return nil
+            }
+            guard address.count >= length else { return nil }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(socketAddress, socklen_t(length), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 else { return nil }
+            return String(cString: host)
+        }
+    }
+
+    func resolve(timeout: TimeInterval = 8) throws -> Data {
+        guard peerHost != nil else {
+            throw NSError(domain: "StikDebug", code: -18, userInfo: [NSLocalizedDescriptionKey: "The paired device has an invalid network address."])
+        }
+        browser.searchForServices(ofType: "_remotepairing._tcp.", inDomain: "local.")
+        defer {
+            browser.stop()
+            services.forEach { $0.stop() }
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        while resolvedAddress == nil && Date() < deadline {
+            RunLoop.current.run(until: min(deadline, Date().addingTimeInterval(0.05)))
+        }
+        guard let resolvedAddress else {
+            throw NSError(domain: "StikDebug", code: -19, userInfo: [NSLocalizedDescriptionKey: "Could not discover the paired device. Keep both devices on the same Wi-Fi network and try again."])
+        }
+        return resolvedAddress
+    }
+
+    func netServiceBrowser(_ browser: NetServiceBrowser, didFind service: NetService, moreComing: Bool) {
+        services.append(service)
+        service.includesPeerToPeer = true
+        service.delegate = self
+        service.resolve(withTimeout: 6)
+    }
+
+    func netServiceDidResolveAddress(_ sender: NetService) {
+        if let address = sender.addresses?.first(where: { Self.numericHost($0) == peerHost }) {
+            resolvedAddress = address
+        }
+    }
+}
 
 typealias LogFunc = (String?) -> Void
 typealias DebugAppCallback = (_ pid: Int32, _ debugProxy: OpaquePointer?, _ remoteServer: OpaquePointer?, _ semaphore: DispatchSemaphore) -> Void
@@ -84,7 +291,8 @@ final class JITEnableContext {
     private init() {
         var path = Array(IdeviceLogFileManager.logURL.path.utf8CString)
         path.withUnsafeMutableBufferPointer { buffer in
-            _ = idevice_init_logger(Info, Debug, buffer.baseAddress)
+            // Debug logging includes pairing-file credentials and protocol payloads.
+            _ = idevice_init_logger(Info, Info, buffer.baseAddress)
         }
     }
 
@@ -117,7 +325,8 @@ final class JITEnableContext {
         guard let ffiError else {
             return makeError(fallback)
         }
-        let message = nsString(from: ffiError.pointee.message, fallback: fallback)
+        let detail = nsString(from: ffiError.pointee.message, fallback: fallback)
+        let message = detail == fallback ? fallback : "\(fallback): \(detail)"
         let error = makeError(message, code: Int(ffiError.pointee.code))
         idevice_error_free(ffiError)
         return error
@@ -140,60 +349,67 @@ final class JITEnableContext {
         logger?(message)
     }
 
-    private func getPairingFile() throws -> OpaquePointer {
+    private func getPairingFile(at url: URL? = nil) throws -> OpaquePointer {
+        // Preserve VectorJIT27's iOS 27.2 identity generation and repair.
         var lastReadError: NSError?
-
         for attempt in 0..<2 {
             let pairingFileURL: URL
-            do {
-                pairingFileURL = attempt == 0
-                    ? try PairingFileStore.ensureRemotePairingRecord()
-                    : try PairingFileStore.regenerateRemotePairingRecord()
-            } catch {
-                throw makeError("Unable to prepare the remote pairing identity: \(error.localizedDescription)", code: -17)
+            if let url {
+                pairingFileURL = url
+            } else {
+                do {
+                    pairingFileURL = attempt == 0
+                        ? try PairingFileStore.ensureRemotePairingRecord()
+                        : try PairingFileStore.regenerateRemotePairingRecord()
+                } catch {
+                    throw makeError("Unable to prepare the remote pairing identity: \(error.localizedDescription)", code: -17)
+                }
             }
-
             var pairingFile: OpaquePointer?
-            let ffiError = pairingFileURL.path.withCString { path in
-                rp_pairing_file_read(path, &pairingFile)
-            }
-
+            let ffiError = pairingFileURL.path.withCString { rp_pairing_file_read($0, &pairingFile) }
             if let ffiError {
-                lastReadError = error(from: ffiError, fallback: "Failed to read the remote pairing identity.")
+                lastReadError = error(from: ffiError, fallback: "Failed to read remote pairing identity")
+                if url != nil { break }
                 continue
             }
-
-            if let pairingFile {
-                return pairingFile
-            }
-
+            if let pairingFile { return pairingFile }
             lastReadError = makeError("idevice returned an empty remote pairing handle.", code: -17)
+            if url != nil { break }
         }
-
-        throw lastReadError ?? makeError("Failed to read the remote pairing identity.", code: -17)
+        throw lastReadError ?? makeError("Failed to read remote pairing identity.", code: -17)
     }
 
-    private func createTunnel(hostname: String) throws -> TunnelHandles {
-        let pairingFile = try getPairingFile()
+    private func createTunnel(hostname: String, target: PairingPlacementTarget? = nil) throws -> TunnelHandles {
+        let pairingFile = try getPairingFile(at: target?.pairingFileURL)
         defer { rp_pairing_file_free(pairingFile) }
 
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = in_port_t(49152).bigEndian
-
-        let deviceIP = DeviceConnectionContext.targetIPAddress
-        let parseResult = deviceIP.withCString { inet_pton(AF_INET, $0, &addr.sin_addr) }
-        guard parseResult == 1 else {
-            throw makeError("Failed to parse target IP address.", code: -18)
+        let address: Data
+        if let target {
+            address = try PairedDeviceDiscovery(address: target.address).resolve()
+        } else {
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            let deviceIP = DeviceConnectionContext.targetIPAddress
+            addr.sin_port = in_port_t(RemotePairingPortResolver.resolve(targetIPAddress: deviceIP)).bigEndian
+            let parseResult = deviceIP.withCString { inet_pton(AF_INET, $0, &addr.sin_addr) }
+            guard parseResult == 1 else {
+                throw makeError("Failed to parse target IP address.", code: -18)
+            }
+            address = withUnsafeBytes(of: &addr) { Data($0) }
         }
 
+        var socketAddress = sockaddr_storage()
+        guard address.count <= MemoryLayout<sockaddr_storage>.size else {
+            throw makeError("Invalid target network address.", code: -18)
+        }
+        withUnsafeMutableBytes(of: &socketAddress) { _ = address.copyBytes(to: $0) }
         var tunnel = TunnelHandles()
-        let ffiError = hostname.withCString { hostname in
-            withUnsafePointer(to: &addr) { pointer in
+        let ffiError = (target?.hostname ?? hostname).withCString { hostname in
+            withUnsafePointer(to: &socketAddress) { pointer in
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                     tunnel_create_rppairing(
                         $0,
-                        socklen_t(MemoryLayout<sockaddr_in>.stride),
+                        socklen_t(address.count),
                         hostname,
                         pairingFile,
                         nil,
@@ -205,24 +421,9 @@ final class JITEnableContext {
             }
         }
 
-        var persistenceError: NSError?
-        do {
-            try PairingFileStore.persistRemotePairingFile(pairingFile)
-        } catch {
-            persistenceError = makeError(
-                "Failed to persist the updated remote pairing identity: \(error.localizedDescription)",
-                code: -20
-            )
-        }
-
         if let ffiError {
             tunnel.free()
             throw error(from: ffiError, fallback: "Failed to create tunnel")
-        }
-
-        if let persistenceError {
-            tunnel.free()
-            throw persistenceError
         }
 
         guard tunnel.adapter != nil, tunnel.handshake != nil else {
@@ -230,6 +431,19 @@ final class JITEnableContext {
             throw makeError("Tunnel was created without valid handles")
         }
 
+        // Persist the updated identity generated during the local handshake,
+        // but never replace the separate identity of an external target device.
+        if target == nil {
+            do {
+                try PairingFileStore.persistRemotePairingFile(pairingFile)
+            } catch {
+                tunnel.free()
+                throw makeError(
+                    "Failed to persist the updated remote pairing identity: \(error.localizedDescription)",
+                    code: -20
+                )
+            }
+        }
         return tunnel
     }
 
@@ -304,20 +518,16 @@ final class JITEnableContext {
         handshake = nil
         lastTunnelError = nil
         tunnelLock.unlock()
-
-        if let oldHandshake {
-            rsd_handshake_free(oldHandshake)
-        }
-        if let oldAdapter {
-            adapter_free(oldAdapter)
-        }
+        if let oldHandshake { rsd_handshake_free(oldHandshake) }
+        if let oldAdapter { adapter_free(oldAdapter) }
     }
 
-    private func withFreshDebugTunnel<T>(
+    func withFreshDebugTunnel<T>(
         hostname: String,
+        target: PairingPlacementTarget? = nil,
         _ body: (OpaquePointer, OpaquePointer) throws -> T
     ) throws -> T {
-        var tunnel = try createTunnel(hostname: hostname)
+        var tunnel = try createTunnel(hostname: hostname, target: target)
         defer { tunnel.free() }
 
         guard let adapter = tunnel.adapter, let handshake = tunnel.handshake else {
@@ -499,22 +709,19 @@ final class JITEnableContext {
     private func withConnectedRemoteServer<T>(
         _ body: (OpaquePointer) throws -> T
     ) throws -> T {
-        try ensureTunnel()
-        guard let adapter, let handshake else {
-            throw makeError("Tunnel is not connected")
-        }
+        try withFreshDebugTunnel(hostname: "StikDebugRemoteServer") { adapter, handshake in
+            var remoteServer: OpaquePointer?
+            if let ffiError = remote_server_connect_rsd(adapter, handshake, &remoteServer) {
+                throw error(from: ffiError, fallback: "Failed to connect remote server")
+            }
 
-        var remoteServer: OpaquePointer?
-        if let ffiError = remote_server_connect_rsd(adapter, handshake, &remoteServer) {
-            throw error(from: ffiError, fallback: "Failed to connect remote server")
-        }
+            guard let remoteServer else {
+                throw makeError("Remote server handle was not created")
+            }
 
-        guard let remoteServer else {
-            throw makeError("Remote server handle was not created")
+            defer { remote_server_free(remoteServer) }
+            return try body(remoteServer)
         }
-
-        defer { remote_server_free(remoteServer) }
-        return try body(remoteServer)
     }
 
     private func withProcessControl<T>(

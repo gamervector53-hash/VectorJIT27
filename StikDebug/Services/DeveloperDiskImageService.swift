@@ -12,7 +12,7 @@ final class DeveloperDiskImageService {
     static var filesAreReady: Bool {
         downloadItems.allSatisfy {
             FileManager.default.fileExists(atPath: directoryURL.appendingPathComponent($0.fileName).path)
-        } && (try? String(contentsOf: mountMethodURL, encoding: .utf8)) == mountMethod.rawValue
+        } && UserDefaults.standard.string(forKey: mountMethodKey) == mountMethod.rawValue
     }
 
     static var usesCryptexDDI: Bool {
@@ -28,8 +28,13 @@ final class DeveloperDiskImageService {
     }
 
     func downloadMissingFiles() async throws {
-        let installedMethod = try? String(contentsOf: Self.mountMethodURL, encoding: .utf8)
+        let installedMethod = UserDefaults.standard.string(forKey: Self.mountMethodKey)
+            ?? (try? String(contentsOf: Self.mountMethodURL, encoding: .utf8))
         let replaceFiles = installedMethod != Self.mountMethod.rawValue
+        try removeObsoleteFiles()
+        if replaceFiles {
+            UserDefaults.standard.removeObject(forKey: Self.mountMethodKey)
+        }
 
         if !Self.usesCryptexDDI {
             try removeCryptexOnlyFiles()
@@ -42,7 +47,7 @@ final class DeveloperDiskImageService {
             }
             try await downloadFile(from: item.urlString, to: destinationURL)
         }
-        try Self.mountMethod.rawValue.write(to: Self.mountMethodURL, atomically: true, encoding: .utf8)
+        UserDefaults.standard.set(Self.mountMethod.rawValue, forKey: Self.mountMethodKey)
     }
 
     func downloadFile(from urlString: String, to destinationURL: URL) async throws {
@@ -75,9 +80,8 @@ final class DeveloperDiskImageService {
         var completedStages = 0.0
 
         progressHandler?(0.0, "Removing existing DDI files...")
-        if fileManager.fileExists(atPath: Self.mountMethodURL.path) {
-            try fileManager.removeItem(at: Self.mountMethodURL)
-        }
+        UserDefaults.standard.removeObject(forKey: Self.mountMethodKey)
+        try removeObsoleteFiles()
         if !Self.usesCryptexDDI {
             try removeCryptexOnlyFiles()
         }
@@ -103,9 +107,17 @@ final class DeveloperDiskImageService {
             progressHandler?(completedStages / totalStages, "\(item.name) ready")
         }
 
-        try Self.mountMethod.rawValue.write(to: Self.mountMethodURL, atomically: true, encoding: .utf8)
+        UserDefaults.standard.set(Self.mountMethod.rawValue, forKey: Self.mountMethodKey)
 
         progressHandler?(1.0, "DDI download complete.")
+    }
+
+    private func removeObsoleteFiles() throws {
+        let legacyDirectory = Self.directoryURL.deletingLastPathComponent()
+            .appendingPathComponent("DDI_Cryptex", isDirectory: true)
+        for url in [Self.mountMethodURL, legacyDirectory] where fileManager.fileExists(atPath: url.path) {
+            try fileManager.removeItem(at: url)
+        }
     }
 
     private func removeCryptexOnlyFiles() throws {
@@ -124,6 +136,7 @@ final class DeveloperDiskImageService {
             : .personalized
     }
 
+    private static let mountMethodKey = "DDIMountMethod"
     private static let mountMethodURL = directoryURL.appendingPathComponent("MountMethod")
     private static let cryptexOnlyFileNames = ["Image.dmg.cryptex_info", "Image.dmg.root_hash"]
 

@@ -27,6 +27,7 @@ func checkMountStatus() -> MountCheckResult {
     do {
         return try JITEnableContext.shared.isDeveloperDiskImageMounted() ? .mounted : .notMounted
     } catch {
+        LogManager.shared.addErrorLog("Failed to check DDI mount status: \(error.localizedDescription)")
         return .unreachable
     }
 }

@@ -4,13 +4,16 @@
 //
 
 import Foundation
+import UIKit
 
 final class TunnelManager: ObservableObject {
     static let shared = TunnelManager()
 
     @Published private(set) var isConnected = false
 
-    private var isStarting = false
+    @Published private(set) var isStarting = false
+    @Published private(set) var lastError: NSError?
+    private var restartPending = false
 
     private init() {}
 
@@ -18,6 +21,18 @@ final class TunnelManager: ObservableObject {
         JITEnableContext.shared.invalidateTunnel()
         runOnMain {
             self.isConnected = false
+        }
+    }
+
+    func restart() {
+        JITEnableContext.shared.invalidateTunnel()
+        runOnMain {
+            self.isConnected = false
+            if self.isStarting {
+                self.restartPending = true
+            } else {
+                self.start()
+            }
         }
     }
 
@@ -33,6 +48,8 @@ final class TunnelManager: ObservableObject {
             return
         }
 
+        lastError = nil
+        isConnected = false
         isStarting = true
 
         DispatchQueue.global(qos: .userInteractive).async { [showErrorUI] in
@@ -76,13 +93,20 @@ final class TunnelManager: ObservableObject {
 
     private func finishStart(_ result: Result<Void, NSError>, showErrorUI: Bool) {
         isStarting = false
+        if restartPending {
+            restartPending = false
+            start()
+            return
+        }
 
         switch result {
         case .success:
+            lastError = nil
             isConnected = true
             LogManager.shared.addInfoLog("Tunnel connected successfully")
             mountDeveloperDiskImageIfNeeded()
         case .failure(let error):
+            lastError = error
             isConnected = false
             handleStartFailure(error, showErrorUI: showErrorUI)
         }
@@ -121,7 +145,7 @@ final class TunnelManager: ObservableObject {
 
         showAlert(
             title: "Invalid Pairing File",
-            message: "The pairing file may be invalid or expired. You can import a new pairing file to replace it.",
+            message: "The pairing file may be invalid or expired. You can import a new pairing file to replace it.\n\n\(connectionDiagnosticDetails())",
             showOk: true,
             showTryAgain: false,
             primaryButtonText: "Select New File"
@@ -148,91 +172,46 @@ func markTunnelDisconnected() {
 }
 
 private func tunnelConnectionLogMessage(for error: NSError) -> String {
-    let target = "\(DeviceConnectionContext.targetIPAddress):49152"
+    let target = RemotePairingPortResolver.lastAttemptDescription
     return "Tunnel connection failed for \(target): \(error.localizedDescription) (Domain: \(error.domain), Code: \(error.code), Raw: \(String(describing: error)))"
 }
 
 private func tunnelConnectionAlertMessage(for error: NSError) -> String {
-    let targetIP = DeviceConnectionContext.targetIPAddress
-    let rawMessage = error.localizedDescription
-    let lowercasedMessage = rawMessage.lowercased()
-
-    let likelyCause: String
-    let recoverySteps: [String]
-
-    if error.code == 48 || lowercasedMessage.contains("address already in use") || lowercasedMessage.contains("port already in use") {
-        likelyCause = "A port needed for the tunnel is already in use."
-        recoverySteps = [
-            "Close other JIT, debugging, proxy, or VPN apps that may be using the tunnel.",
-            "Disconnect and reconnect LocalDevVPN.",
-            "Restart StikDebug, then try again.",
-            "If it keeps happening, reboot the device to clear the stuck port."
-        ]
-    } else if error.code == 54 || lowercasedMessage.contains("connection reset") {
-        likelyCause = "The device or VPN closed the tunnel connection before setup finished."
-        recoverySteps = [
-            "Open LocalDevVPN and confirm the VPN is connected.",
-            "Make sure LocalDevVPN is using the default \(DeviceConnectionContext.defaultTargetIPAddress) address.",
-            "Reconnect Wi-Fi and LocalDevVPN, then try again.",
-            "If this keeps happening, select a fresh pairing file."
-        ]
-    } else if error.code == -18 || lowercasedMessage.contains("parse target ip") {
-        likelyCause = "The configured target IP address is not valid."
-        recoverySteps = [
-            "Open Settings and check the target IP address.",
-            "Use the default \(DeviceConnectionContext.defaultTargetIPAddress)."
-        ]
-    } else if lowercasedMessage.contains("missing field") &&
-                (lowercasedMessage.contains("public_key") ||
-                 lowercasedMessage.contains("private_key") ||
-                 lowercasedMessage.contains("identifier")) {
-        likelyCause = "A classic MobileDevice pairing file was mistaken for an RPPairing identity."
-        recoverySteps = [
-            "VectorJIT27 keeps the classic file separate and generates a fresh remote pairing identity.",
-            "Tap Try Again once LocalDevVPN is connected.",
-            "If the regenerated identity still fails, disconnect and reconnect LocalDevVPN before retrying."
-        ]
-    } else if lowercasedMessage.contains("timed out") || lowercasedMessage.contains("timeout") {
-        likelyCause = "The app could not reach the device before the connection timed out."
-        recoverySteps = [
-            "Confirm Wi-Fi and LocalDevVPN are both connected.",
-            "Wake and unlock the target device.",
-            "Confirm LocalDevVPN is exposing the device at \(targetIP)."
-        ]
-    } else if lowercasedMessage.contains("network is unreachable") || lowercasedMessage.contains("no route") {
-        likelyCause = "The VPN route to the device is not available."
-        recoverySteps = [
-            "Disconnect and reconnect LocalDevVPN.",
-            "Confirm iOS shows the VPN indicator.",
-            "Try switching Wi-Fi off and on."
-        ]
+    let pairingInstructions: String
+    if #available(iOS 27.0, *) {
+        pairingInstructions = "Generate and place a fresh pairing file using the built-in pairing menu in Settings or iloader."
     } else {
-        likelyCause = "The tunnel could not be created."
-        recoverySteps = [
-            "Confirm Wi-Fi and LocalDevVPN are connected.",
-            "Wake and unlock the target device.",
-            "Reconnect LocalDevVPN, then try again."
-        ]
+        pairingInstructions = "Generate and place a fresh pairing file using iloader."
     }
 
-    let steps = recoverySteps.enumerated()
-        .map { "\($0.offset + 1). \($0.element)" }
-        .joined(separator: "\n")
-
     return """
-    \(likelyCause)
+    Code \(error.code): \(error.localizedDescription)
 
-    Target: \(targetIP):49152
-    Expected LocalDevVPN IP: \(DeviceConnectionContext.defaultTargetIPAddress)
+    Troubleshooting:
+    1. Make sure Wi-Fi is connected or Cellular Data is disabled, and LocalDevVPN is enabled.
+    2. Restart your iPhone or iPad, then re-enable LocalDevVPN and try again.
+    3. \(pairingInstructions)
 
-    Try this:
-    \(steps)
+    Target attempted: \(RemotePairingPortResolver.lastAttemptDescription)
 
-    Technical details:
-    Code \(error.code): \(rawMessage)
+    \(connectionDiagnosticDetails())
     """
 }
 
+func connectionDiagnosticDetails() -> String {
+    let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "Unknown"
+    var systemInfo = utsname()
+    uname(&systemInfo)
+    let model = withUnsafePointer(to: &systemInfo.machine) {
+        $0.withMemoryRebound(to: CChar.self, capacity: 1) { String(cString: $0) }
+    }
+
+    return """
+    \(version)
+    \(UIDevice.current.systemName) \(UIDevice.current.systemVersion)
+    \(DeviceModelName.name(for: model))
+    """
+}
 
 private func isRetryableTunnelError(_ error: NSError) -> Bool {
     let message = error.localizedDescription.lowercased()
