@@ -23,7 +23,9 @@ enum PairingFileStore {
         .propertyList
     ]
 
-    private static let remoteFileName = "rp_pairing_file.plist"
+    // The on-device pairing service writes a remote-pairing identity, not the classic MobileDevice record.
+    static let fileName = "rp_pairing_file.plist"
+    private static let remoteFileName = fileName
     private static let classicFileName = "pairingFile.plist"
     private static let archivedClassicFileName = "classic_pairing_file.plist"
 

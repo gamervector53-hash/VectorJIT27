@@ -39,7 +39,8 @@ private enum IdeviceBridge {
         }
 
         let code = Int(ffiError.pointee.code)
-        let message = string(from: ffiError.pointee.message) ?? fallback
+        let detail = string(from: ffiError.pointee.message) ?? fallback
+        let message = detail == fallback ? fallback : "\(fallback): \(detail)"
         idevice_error_free(ffiError)
         return makeError(domain: domain, code: code, message: message)
     }
@@ -117,7 +118,7 @@ private enum IdeviceBridge {
         return try body(client)
     }
 
-    static func plistDictionaries(adapter: OpaquePointer, handshake: OpaquePointer) throws -> [[String: Any]] {
+    static func plistDictionaries(adapter: OpaquePointer, handshake: OpaquePointer, applicationType: String? = nil) throws -> [[String: Any]] {
         try withConnectedClient(
             fallback: "Failed to connect to installation proxy",
             missingClientMessage: "Installation proxy client was not created",
@@ -126,7 +127,15 @@ private enum IdeviceBridge {
         ) { client in
             var rawApps: UnsafeMutableRawPointer?
             var count = 0
-            if let ffiError = installation_proxy_get_apps(client, nil, nil, 0, &rawApps, &count) {
+            let ffiError: UnsafeMutablePointer<IdeviceFfiError>?
+            if let applicationType {
+                ffiError = applicationType.withCString {
+                    installation_proxy_get_apps(client, $0, nil, 0, &rawApps, &count)
+                }
+            } else {
+                ffiError = installation_proxy_get_apps(client, nil, nil, 0, &rawApps, &count)
+            }
+            if let ffiError {
                 throw consumeFFIError(ffiError, fallback: "Failed to fetch installed apps")
             }
 
@@ -264,45 +273,50 @@ private enum IdeviceBridge {
 extension JITEnableContext {
     func isDeveloperDiskImageMounted() throws -> Bool {
         try IdeviceBridge.withTunnelHandles(for: self) { adapter, handshake in
-            var installed: UnsafeMutablePointer<InstalledCryptexC>?
-            let ffiError = cryptexd_installed_ddi(adapter, handshake, &installed)
-            let queryError = ffiError.map {
-                IdeviceBridge.consumeFFIError($0, fallback: "Failed to query installed DDI cryptex")
-            }
-            defer { cryptexd_free_installed_cryptex(installed) }
-            if installed != nil {
-                return true
+            var cryptexQuerySucceeded = false
+            var cryptexQueryError: NSError?
+            if DeveloperDiskImageService.usesCryptexDDI {
+                var installed: UnsafeMutablePointer<InstalledCryptexC>?
+                defer { cryptexd_free_installed_cryptex(installed) }
+                if let ffiError = cryptexd_installed_ddi(adapter, handshake, &installed) {
+                    cryptexQueryError = IdeviceBridge.consumeFFIError(ffiError, fallback: "Failed to query installed DDI cryptex")
+                } else {
+                    cryptexQuerySucceeded = true
+                    if installed != nil {
+                        return true
+                    }
+                }
             }
 
-            let legacyMounted = (try? IdeviceBridge.withConnectedClient(
-                fallback: "Failed to connect to image mounter",
-                missingClientMessage: "Image mounter client was not created",
-                connect: { image_mounter_connect_rsd(adapter, handshake, $0) },
-                cleanup: { image_mounter_free($0) }
-            ) { client in
-                var devices: UnsafeMutablePointer<plist_t?>?
-                var deviceCount = 0
-                if let error = image_mounter_copy_devices(client, &devices, &deviceCount) {
-                    throw IdeviceBridge.consumeFFIError(error, fallback: "Failed to fetch mounted devices")
-                }
-                if let devices {
-                    for index in 0..<deviceCount {
-                        plist_free(devices[index])
+            do {
+                return try IdeviceBridge.withConnectedClient(
+                    fallback: "Failed to connect to image mounter",
+                    missingClientMessage: "Image mounter client was not created",
+                    connect: { image_mounter_connect_rsd(adapter, handshake, $0) },
+                    cleanup: { image_mounter_free($0) }
+                ) { client in
+                    var devices: UnsafeMutablePointer<plist_t?>?
+                    var deviceCount = 0
+                    if let error = image_mounter_copy_devices(client, &devices, &deviceCount) {
+                        throw IdeviceBridge.consumeFFIError(error, fallback: "Failed to fetch mounted devices")
                     }
-                    idevice_data_free(
-                        UnsafeMutableRawPointer(devices).assumingMemoryBound(to: UInt8.self),
-                        UInt(deviceCount * MemoryLayout<plist_t?>.stride)
-                    )
+                    if let devices {
+                        for index in 0..<deviceCount {
+                            plist_free(devices[index])
+                        }
+                        idevice_data_free(
+                            UnsafeMutableRawPointer(devices).assumingMemoryBound(to: UInt8.self),
+                            UInt(deviceCount * MemoryLayout<plist_t?>.stride)
+                        )
+                    }
+                    return deviceCount > 0
                 }
-                return deviceCount > 0
-            }) ?? false
-            if legacyMounted {
-                return true
+            } catch {
+                if cryptexQuerySucceeded {
+                    return false
+                }
+                throw cryptexQueryError ?? (error as NSError)
             }
-            if let queryError {
-                throw queryError
-            }
-            return false
         }
     }
 
@@ -791,7 +805,7 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
 
     var address = sockaddr_in()
     address.sin_family = sa_family_t(AF_INET)
-    address.sin_port = in_port_t(49152).bigEndian
+    address.sin_port = in_port_t(RemotePairingPortResolver.resolve(targetIPAddress: deviceIP)).bigEndian
 
     let inetResult = deviceIP.withCString { inet_pton(AF_INET, $0, &address.sin_addr) }
     guard inetResult == 1 else {
@@ -883,4 +897,93 @@ func clear_simulated_location() -> Int32 {
     }
 
     return LocationSimulationStatus.ok
+}
+
+struct PairingDestinationApp: Identifiable, Sendable {
+    let bundleID: String
+    let name: String
+    let path: String
+    var id: String { bundleID }
+
+    static func isLiveContainer(bundleID: String, names: [String]) -> Bool {
+        if bundleID.lowercased().hasPrefix("com.kdt.livecontainer") {
+            return true
+        }
+        return names.contains {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                .range(of: "^LiveContainer(?:[0-9]+|[ ]+[0-9]+|[ ]*\\([^)]*\\))?$", options: [.regularExpression, .caseInsensitive]) != nil
+        }
+    }
+}
+
+extension JITEnableContext {
+    func pairingDestinationApps(target: PairingPlacementTarget? = nil) throws -> [PairingDestinationApp] {
+        try withFreshDebugTunnel(hostname: "StikDebugPairingApps", target: target) { adapter, handshake in
+            let paths = [
+                "Antrag": "pairingFile.plist",
+                "Auto Capture": "rpPairingFile.plist",
+                "Feather": "pairingFile.plist",
+                "Ksign": "pairingFile.plist",
+                "LiveContainer": "SideStore/Documents/ALTPairingFile.mobiledevicepairing",
+                "Protokolle": "pairingFile.plist",
+                "Reynard": "pairingFile.plist",
+                "SideStore": "ALTPairingFile.mobiledevicepairing",
+                "StikDebug": "pairingFile.plist",
+                "StosDebug": "pairingFile.plist"
+            ]
+            let installed = try IdeviceBridge.plistDictionaries(adapter: adapter, handshake: handshake)
+            let supported = installed.compactMap { app -> PairingDestinationApp? in
+                guard let bundleID = app["CFBundleIdentifier"] as? String else { return nil }
+                let name = IdeviceBridge.appName(from: app)
+                let names = [name, app["CFBundleName"] as? String ?? ""]
+                let isLiveContainer = PairingDestinationApp.isLiveContainer(bundleID: bundleID, names: names)
+                let path = isLiveContainer ? paths["LiveContainer"] : paths.first { entry in
+                    names.contains { $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                        .localizedCaseInsensitiveCompare(entry.key) == .orderedSame }
+                }?.value
+                guard let path, bundleID != "com.stik.sj",
+                      target != nil || isLiveContainer || bundleID != Bundle.main.bundleIdentifier else { return nil }
+                return PairingDestinationApp(bundleID: bundleID, name: name, path: path)
+            }
+            LogManager.shared.addInfoLog("Pairing destinations: \(installed.count) installed app records, \(supported.count) supported apps")
+            return supported.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        }
+    }
+
+    func placePairingFile(_ data: Data, in app: PairingDestinationApp, target: PairingPlacementTarget? = nil) throws {
+        try withFreshDebugTunnel(hostname: "StikDebugPairingPlacement", target: target) { adapter, handshake in
+            let client = try IdeviceBridge.connectClient(
+                fallback: "Failed to connect to app Documents",
+                missingClientMessage: "House Arrest client was not created",
+                connect: { house_arrest_client_connect_rsd(adapter, handshake, $0) }
+            )
+            var afc: OpaquePointer?
+            // Vend consumes the House Arrest handle, including when it fails.
+            if let error = house_arrest_vend_documents(client, app.bundleID, &afc) {
+                throw IdeviceBridge.consumeFFIError(error, fallback: "Failed to open \(app.name)'s Documents folder")
+            }
+            guard let afc else {
+                throw IdeviceBridge.makeError(message: "App Documents connection was not created")
+            }
+            defer { afc_client_free(afc) }
+            var file: OpaquePointer?
+            if let error = afc_file_open(afc, "/Documents/\(app.path)", AfcWr, &file) {
+                throw IdeviceBridge.consumeFFIError(error, fallback: "Failed to open the pairing file in \(app.name)")
+            }
+            guard let file else {
+                throw IdeviceBridge.makeError(message: "Pairing file handle was not created")
+            }
+            let writeError = data.withUnsafeBytes {
+                afc_file_write(file, $0.bindMemory(to: UInt8.self).baseAddress, data.count)
+            }
+            let closeError = afc_file_close(file)
+            if let writeError {
+                if let closeError { idevice_error_free(closeError) }
+                throw IdeviceBridge.consumeFFIError(writeError, fallback: "Failed to write the pairing file to \(app.name)")
+            }
+            if let closeError {
+                throw IdeviceBridge.consumeFFIError(closeError, fallback: "Failed to close the pairing file in \(app.name)")
+            }
+        }
+    }
 }

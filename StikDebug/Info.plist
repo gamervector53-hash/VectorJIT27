@@ -16,8 +16,14 @@
 			</array>
 		</dict>
 	</array>
+		<key>NSLocalNetworkUsageDescription</key>
+	<string>StikDebug discovers this iPhone's Remote Pairing service to enable JIT.</string>
 	<key>NSBonjourServices</key>
 	<array>
+		<string>_remotepairing._tcp</string>
+		<string>_remotepairing-manual-pairing._tcp</string>
+		<string>_remotepairing-pairable-host._tcp</string>
+		<string>_stikpairprobe._tcp</string>
 		<string>_stikdebug._tcp</string>
 		<string>_stikdebug._udp</string>
 	</array>

@@ -2,10 +2,6 @@
    <img width="217" height="217" src="/assets/StikDebug.png" alt="Logo">
 </div>
 
-> **VectorJIT27 build:** this repository separates classic MobileDevice pairing records from the RPPairing identity used by the iOS 17.4+ tunnel, automatically generates and persists the remote identity, and adds iOS 27.2 tunnel recovery. See [VECTORJIT.md](VECTORJIT.md) for implementation details.
-
-
-
 <div align="center">
   <h1><b>StikDebug</b></h1>
   <p><i>An on-device debugger/JIT enabler for iOS versions 17.4+ powered by <a href="https://github.com/jkcoxson/idevice">idevice</a>.</i></p>
@@ -14,10 +10,11 @@
 <h3 align="center">
   <a href="https://discord.gg/ZnNcrRT3M8"><img src="https://img.shields.io/badge/Discord-join%20us-7289DA?logo=discord&logoColor=white&style=for-the-badge&labelColor=23272A" /></a>&nbsp;
   <a href="https://github.com/StikDebug/StikDebug/blob/main/LICENSE"><img src="https://img.shields.io/github/license/StikDebug/StikDebug?label=License&color=5865F2&style=for-the-badge&labelColor=23272A" /></a>&nbsp;
-  <a href="https://github.com/StikDebug/StikDebug/stargazers"><img src="https://img.shields.io/github/stars/StikDebug/StikDebug?label=Stars&color=FEE75C&style=for-the-badge&labelColor=23272A" /></a>&nbsp;
-  <a href="https://github.com/StikDebug/StikDebug/releases"><img src="https://img.shields.io/github/v/release/StikDebug/StikDebug?label=Latest&color=00BFFF&style=for-the-badge&labelColor=23272A" /></a>
+  <a href="https://github.com/StikDebug/StikDebug"><img src="https://img.shields.io/github/stars/StikDebug/StikDebug?label=Stars&color=FEE75C&style=for-the-badge&labelColor=23272A" /></a>&nbsp;
+  <a href="https://github.com/StikDebug/StikDebug/releases"><img src="https://img.shields.io/github/v/release/StikDebug/StikDebug?label=Latest&color=00BFFF&style=for-the-badge&labelColor=23272A" /></a>&nbsp;
+   <a href="https://deepwiki.com/StikDebug/StikDebug"><img src="https://img.shields.io/badge/Ask-DeepWiki-grey?style=for-the-badge&labelColor=23272A&color=007ec6" /></a>
    <br />
-</h6>
+</h3>
 
 ## Features
 - **JIT:** Enable Just-In-Time compilation for sideloaded apps that have the `get-task-allow` entitlement.
@@ -36,7 +33,7 @@
 <h3 align="center">
 <a href="https://altdirect.app/?url=https://stikdebug.xyz/index.json" target="_blank"><img src="https://altdirect.app/assets/png/AltSource_Blue.png" alt="Add AltSource" width="200"></a>
 &nbsp;
-<a href="https://github.com/StikDebug/StikDebug/releases/download/3.1.13/StikDebug-3.1.13.ipa" target="_blank"><img src="https://altdirect.app/assets/png/Download_Blue.png" alt="Download .ipa" width="200"></a>
+<a href="https://github.com/StikDebug/StikDebug/releases/latest/download/StikDebug-3.1.15.ipa" target="_blank"><img src="https://altdirect.app/assets/png/Download_Blue.png" alt="Download .ipa" width="200"></a>
 </h3>
 
 ## Compatibility
@@ -46,6 +43,8 @@
 | 1.0 – 17.3.X             | Not supported        | Uses Different Connection Protocols                                   |
 | 17.4 – 18.x              | Fully supported      | Stable                                                                |
 | 26.0+              | Supported            | Limited App Availability (Developers need to update their apps to work.) |
+
+See [Officially Supported Apps](SUPPORTED_APPS.md) for the apps supported by the StikDebug team and their bundled scripts.
 
 ## How to Enable JIT
 
@@ -59,7 +58,7 @@ StikDebug enables **JIT** for sideloaded apps on iOS 17.4+ without needing a com
 
 ### Steps
 1. **Obtain a pairing file**  
-   - Detailed guide: [Pairing File Instructions](https://github.com/StikDebug/StikDebug-Guide/blob/main/pairing_file.md) (or ask in Discord).
+   - Detailed guide: [Pairing File Instructions](PAIRING.md) (or ask in Discord).
 
 2. **Set up VPN**  
    - Launch LocalDevVPN and enable the VPN.
@@ -148,10 +147,6 @@ To propose a new feature, open a feature request issue and provide:
 - Make sure everything builds and works without errors.
 
 We appreciate your time and effort in helping improve this project.
-
-## Code Help
-
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/StikDebug/StikDebug)
 
 ## License
 StikDebug is licensed under **AGPL-3.0**. See [`LICENSE`](LICENSE) for details.
